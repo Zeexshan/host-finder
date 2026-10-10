@@ -180,13 +180,23 @@ function describeFirestoreError(err: unknown, action: string, deniedCause: strin
   return `Something went wrong while ${action}${code ? ` (${code})` : ''}. Please try again.`;
 }
 
+function getMeasuredPing(from: Player, toId: string): number | undefined {
+  const pings = from.radminPings;
+  if (!pings || typeof pings !== 'object') return undefined;
+  const value = pings[toId];
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  return Math.min(1000, Math.max(1, value));
+}
+
 function calculateEstimatedPing(p1: Player, p2: Player): { ping: number; isMeasured: boolean } {
   if (p1.id === p2.id) return { ping: 0, isMeasured: false };
-  if (p1.radminPings && p1.radminPings[p2.id] !== undefined) {
-    return { ping: p1.radminPings[p2.id], isMeasured: true };
+  const forward = getMeasuredPing(p1, p2.id);
+  if (forward !== undefined) {
+    return { ping: forward, isMeasured: true };
   }
-  if (p2.radminPings && p2.radminPings[p1.id] !== undefined) {
-    return { ping: p2.radminPings[p1.id], isMeasured: true };
+  const reverse = getMeasuredPing(p2, p1.id);
+  if (reverse !== undefined) {
+    return { ping: reverse, isMeasured: true };
   }
   const distanceKm = calculateGreatCircleKm(p1.lat, p1.lng, p2.lat, p2.lng);
   const est = Math.round((distanceKm / 100) * 1.8 + 10);
@@ -839,10 +849,7 @@ export default function App() {
         totalPairs++;
         const p1 = playersList[i];
         const p2 = playersList[j];
-        if (
-          (p1.radminPings && p1.radminPings[p2.id] !== undefined) ||
-          (p2.radminPings && p2.radminPings[p1.id] !== undefined)
-        ) {
+        if (getMeasuredPing(p1, p2.id) !== undefined || getMeasuredPing(p2, p1.id) !== undefined) {
           measuredCount++;
         }
       }
