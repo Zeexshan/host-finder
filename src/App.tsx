@@ -20,7 +20,8 @@ import {
   Sparkles,
   Search,
   Lock,
-  Layers
+  Layers,
+  LogOut
 } from 'lucide-react';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
@@ -33,7 +34,14 @@ import {
   Timestamp,
   serverTimestamp
 } from 'firebase/firestore';
-import { getAuth, signInAnonymously, onAuthStateChanged, User } from 'firebase/auth';
+import {
+  initializeAuth,
+  indexedDBLocalPersistence,
+  getAuth,
+  signInAnonymously,
+  onAuthStateChanged,
+  User
+} from 'firebase/auth';
 
 const GlobeView = lazy(() => import('./GlobeView'));
 
@@ -53,6 +61,7 @@ interface Player {
   canHost: 'yes' | 'no' | 'only_if_needed';
   radminPings?: Record<string, number>;
   joinedAt: number;
+  expiresAt: Timestamp;
 }
 
 interface SessionDoc {
@@ -99,6 +108,14 @@ const firebaseConfig = {
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "65478399967",
   appId: import.meta.env.VITE_FIREBASE_APP_ID || "1:65478399967:web:e0c8bdca3cc469fce7566a"
 };
+
+function getOrCreateAuth(app: any) {
+  try {
+    return initializeAuth(app, { persistence: indexedDBLocalPersistence });
+  } catch {
+    return getAuth(app);
+  }
+}
 
 function generateCryptoSessionId(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
@@ -187,7 +204,7 @@ export default function App() {
   useEffect(() => {
     try {
       const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-      const auth = getAuth(app);
+      const auth = getOrCreateAuth(app);
       const unsubscribe = onAuthStateChanged(auth, user => {
         if (user) {
           setCurrentUser(user);
@@ -209,12 +226,18 @@ export default function App() {
       setSessionDoc(null);
       setSessionNotFound(false);
       setSessionExpired(false);
+      setPlayers({});
+      setSelectedHostId(null);
+      setHasAnalyzed(false);
       return;
     }
 
     setSessionLoading(true);
     setSessionNotFound(false);
     setSessionExpired(false);
+    setPlayers({});
+    setSelectedHostId(null);
+    setHasAnalyzed(false);
 
     const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
     const db = getFirestore(app);
@@ -227,6 +250,9 @@ export default function App() {
         if (!snap.exists()) {
           setSessionNotFound(true);
           setSessionDoc(null);
+          setPlayers({});
+          setSelectedHostId(null);
+          setHasAnalyzed(false);
           return;
         }
         const data = snap.data() as SessionDoc;
@@ -412,14 +438,49 @@ export default function App() {
     });
   }, [sessionId]);
 
+  const exitSession = useCallback(() => {
+    const url = new URL(window.location.href);
+    url.searchParams.delete('session');
+    window.history.pushState({}, '', url.pathname);
+    setSessionId('');
+    setSessionDoc(null);
+    setPlayers({});
+    setSelectedHostId(null);
+    setHasAnalyzed(false);
+    setSessionNotFound(false);
+    setSessionExpired(false);
+    setName('');
+    setCityName('');
+    setLat(null);
+    setLng(null);
+    setCustomPings({});
+  }, []);
+
   const handleJoinOrUpdate = useCallback(async () => {
-    if (!currentUser || !sessionId || !name.trim() || lat === null || lng === null) return;
+    if (
+      !currentUser ||
+      !sessionId ||
+      !name.trim() ||
+      lat === null ||
+      lng === null ||
+      latencyMs === null ||
+      jitterMs === null
+    ) {
+      return;
+    }
+
     const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
     const db = getFirestore(app);
     const playerRef = doc(db, 'sessions', sessionId, 'players', currentUser.uid);
 
+    const maxExpiry = Date.now() + 24 * 60 * 60 * 1000;
+    const targetExpiry = sessionDoc?.expiresAt
+      ? Math.min(sessionDoc.expiresAt.toMillis(), maxExpiry)
+      : maxExpiry;
+    const playerExpiresAt = Timestamp.fromMillis(targetExpiry);
+
     const cleanName = name.trim().slice(0, 24);
-    const myPlayer: Player = {
+    const myPlayer: any = {
       id: currentUser.uid,
       userId: currentUser.uid,
       name: cleanName,
@@ -429,13 +490,17 @@ export default function App() {
       connectionType,
       uploadMbps: Math.max(1, Math.min(2000, uploadMbps)),
       downloadMbps: Math.max(1, Math.min(2000, downloadMbps)),
-      latencyMs: latencyMs !== null ? Math.max(0, Math.min(1000, latencyMs)) : 20,
-      jitterMs: jitterMs !== null ? Math.max(0, Math.min(500, jitterMs)) : 2,
+      latencyMs: Math.max(0, Math.min(1000, latencyMs)),
+      jitterMs: Math.max(0, Math.min(500, jitterMs)),
       pcStrength,
       canHost,
-      radminPings: customPings,
-      joinedAt: Date.now()
+      joinedAt: Date.now(),
+      expiresAt: playerExpiresAt
     };
+
+    if (customPings && Object.keys(customPings).length > 0) {
+      myPlayer.radminPings = customPings;
+    }
 
     try {
       await setDoc(playerRef, myPlayer);
@@ -445,6 +510,7 @@ export default function App() {
   }, [
     currentUser,
     sessionId,
+    sessionDoc,
     name,
     cityName,
     lat,
@@ -692,6 +758,8 @@ export default function App() {
     return calculateEstimatedPing(fullP1, fullP2).ping;
   }, [players]);
 
+  const isNetworkBenchmarkReady = latencyMs !== null && jitterMs !== null;
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none">
       <header className="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-md sticky top-0 z-40 px-4 py-3 flex items-center justify-between">
@@ -722,6 +790,14 @@ export default function App() {
               >
                 {isCopied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
               </button>
+              <button
+                onClick={exitSession}
+                className="ml-2 pl-2 border-l border-slate-700 hover:text-rose-400 transition flex items-center gap-1 text-slate-400"
+                title="Exit Session"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Exit</span>
+              </button>
             </div>
           )}
 
@@ -738,7 +814,7 @@ export default function App() {
       {authError && (
         <div className="bg-rose-950/90 border-b border-rose-800 px-4 py-2.5 text-xs text-rose-200 flex items-center gap-2">
           <AlertTriangle className="w-4 h-4 text-rose-400 flex-shrink-0" />
-          <span>Firebase Connection Error: {authError}</span>
+          <span>Firebase Error: {authError}</span>
         </div>
       )}
 
@@ -999,9 +1075,9 @@ export default function App() {
                           min={0}
                           max={1000}
                           value={latencyMs !== null ? latencyMs : ''}
-                          placeholder="Run Auto-Test"
-                          onChange={e => setLatencyMs(e.target.value ? Number(e.target.value) : null)}
-                          className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs mt-0.5"
+                          placeholder="Required"
+                          readOnly
+                          className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs mt-0.5 cursor-not-allowed opacity-90"
                         />
                       </div>
                       <div>
@@ -1011,9 +1087,9 @@ export default function App() {
                           min={0}
                           max={500}
                           value={jitterMs !== null ? jitterMs : ''}
-                          placeholder="Run Auto-Test"
-                          onChange={e => setJitterMs(e.target.value ? Number(e.target.value) : null)}
-                          className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs mt-0.5"
+                          placeholder="Required"
+                          readOnly
+                          className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs mt-0.5 cursor-not-allowed opacity-90"
                         />
                       </div>
                     </div>
@@ -1115,9 +1191,16 @@ export default function App() {
                     </div>
                   )}
 
+                  {!isNetworkBenchmarkReady && (
+                    <div className="p-2 rounded bg-amber-950/50 border border-amber-800/60 text-[11px] text-amber-300 flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />
+                      <span>Please run the Auto-Test benchmark before joining.</span>
+                    </div>
+                  )}
+
                   <button
                     onClick={handleJoinOrUpdate}
-                    disabled={!name.trim() || lat === null || lng === null}
+                    disabled={!name.trim() || lat === null || lng === null || !isNetworkBenchmarkReady}
                     className="w-full py-2.5 px-3 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 disabled:pointer-events-none font-semibold text-xs text-white shadow-md shadow-cyan-900/30 transition flex items-center justify-center gap-1.5"
                   >
                     <CheckCircle2 className="w-4 h-4" />

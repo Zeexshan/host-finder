@@ -7,7 +7,10 @@ service cloud.firestore {
     }
 
     function isValidPlayer(data, uid) {
-      return data.userId == uid
+      return data.keys().hasOnly(['id', 'name', 'userId', 'lat', 'lng', 'cityName', 'connectionType', 'uploadMbps', 'downloadMbps', 'latencyMs', 'jitterMs', 'pcStrength', 'canHost', 'joinedAt', 'expiresAt', 'radminPings'])
+        && data.keys().hasAll(['id', 'name', 'userId', 'lat', 'lng', 'cityName', 'connectionType', 'uploadMbps', 'downloadMbps', 'latencyMs', 'jitterMs', 'pcStrength', 'canHost', 'joinedAt', 'expiresAt'])
+        && data.id == uid
+        && data.userId == uid
         && data.name is string
         && data.name.size() > 0
         && data.name.size() <= 24
@@ -34,16 +37,21 @@ service cloud.firestore {
         && data.jitterMs <= 500
         && data.pcStrength in ['low', 'medium', 'high']
         && data.canHost in ['yes', 'no', 'only_if_needed']
+        && data.joinedAt is number
+        && data.expiresAt is timestamp
+        && data.expiresAt > request.time
+        && data.expiresAt <= request.time + duration.value(24, 'h')
         && (!('radminPings' in data) || (data.radminPings is map && data.radminPings.size() <= 64));
     }
 
     match /sessions/{sessionId} {
-      allow read: if isSignedIn();
+      allow get: if isSignedIn();
+      allow list: if false;
 
       allow create: if isSignedIn()
         && sessionId.matches('^[a-zA-Z0-9_-]{16}$')
-        && request.resource.data.keys().hasAll(['createdAt', 'expiresAt', 'createdBy'])
-        && request.resource.data.createdAt is timestamp
+        && request.resource.data.keys().hasOnly(['createdAt', 'expiresAt', 'createdBy'])
+        && request.resource.data.createdAt == request.time
         && request.resource.data.expiresAt is timestamp
         && request.resource.data.expiresAt > request.time
         && request.resource.data.expiresAt <= request.time + duration.value(24, 'h')
@@ -56,6 +64,7 @@ service cloud.firestore {
 
         allow create, update: if isSignedIn()
           && request.auth.uid == uid
+          && get(/databases/$(database)/documents/sessions/$(sessionId)).data.expiresAt > request.time
           && isValidPlayer(request.resource.data, uid);
 
         allow delete: if isSignedIn()
