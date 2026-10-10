@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, Suspense, lazy } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef, Suspense, lazy } from 'react';
 import {
   Globe2,
   Copy,
@@ -146,6 +146,38 @@ function calculateGreatCircleKm(lat1: number, lon1: number, lat2: number, lon2: 
   return R * c;
 }
 
+function getErrorCode(err: unknown): string {
+  if (err && typeof err === 'object' && typeof (err as { code?: unknown }).code === 'string') {
+    return (err as { code: string }).code;
+  }
+  return '';
+}
+
+function describeAuthError(err: unknown): string {
+  const code = getErrorCode(err);
+  if (code === 'auth/operation-not-allowed' || code === 'auth/admin-restricted-operation') {
+    return 'Anonymous sign-in is disabled for this Firebase project, so sessions cannot be loaded or created. The site owner must enable the Anonymous provider in Firebase Authentication.';
+  }
+  if (code === 'auth/network-request-failed') {
+    return 'Could not reach Firebase to sign in. Check your connection and reload the page.';
+  }
+  return `Anonymous sign-in failed${code ? ` (${code})` : ''}. Sessions cannot be loaded or created until sign-in succeeds. Reload the page to try again.`;
+}
+
+function describeFirestoreError(err: unknown, action: string, deniedCause: string): string {
+  const code = getErrorCode(err);
+  if (code === 'permission-denied') {
+    return `Permission denied while ${action}. ${deniedCause}`;
+  }
+  if (code === 'unauthenticated') {
+    return `You are not signed in, so ${action} was blocked. Reload the page to sign in again.`;
+  }
+  if (code === 'unavailable') {
+    return `Could not reach Firestore while ${action}. Check your connection and try again.`;
+  }
+  return `Something went wrong while ${action}${code ? ` (${code})` : ''}. Please try again.`;
+}
+
 function calculateEstimatedPing(p1: Player, p2: Player): { ping: number; isMeasured: boolean } {
   if (p1.id === p2.id) return { ping: 0, isMeasured: false };
   if (p1.radminPings && p1.radminPings[p2.id] !== undefined) {
@@ -200,6 +232,9 @@ export default function App() {
   const [isLocating, setIsLocating] = useState<boolean>(false);
   const [locatingError, setLocatingError] = useState<string>('');
   const [showSecurityModal, setShowSecurityModal] = useState<boolean>(false);
+  const [sessionError, setSessionError] = useState<string>('');
+  const [appError, setAppError] = useState<string>('');
+  const stopListenersRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     try {
@@ -210,51 +245,91 @@ export default function App() {
           setCurrentUser(user);
           setAuthError('');
         } else {
+          setCurrentUser(null);
           signInAnonymously(auth).catch(err => {
-            setAuthError(err.message || 'Firebase anonymous sign-in failed');
+            setAuthError(describeAuthError(err));
           });
         }
       });
       return () => unsubscribe();
-    } catch (err: any) {
-      setAuthError(err.message || 'Firebase initialization failed');
+    } catch {
+      setAuthError('Firebase could not be initialized, so sessions cannot be loaded or created. Reload the page to try again.');
     }
   }, []);
 
   useEffect(() => {
+    const onPopState = () => {
+      setSessionId(new URLSearchParams(window.location.search).get('session') || '');
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  useEffect(() => {
+    setSessionDoc(null);
+    setSessionNotFound(false);
+    setSessionExpired(false);
+    setSessionError('');
+    setPlayers({});
+    setSelectedHostId(null);
+    setHasAnalyzed(false);
+    setCustomPings({});
+
     if (!sessionId || !currentUser) {
-      setSessionDoc(null);
-      setSessionNotFound(false);
-      setSessionExpired(false);
-      setPlayers({});
-      setSelectedHostId(null);
-      setHasAnalyzed(false);
+      setSessionLoading(false);
       return;
     }
 
     setSessionLoading(true);
-    setSessionNotFound(false);
-    setSessionExpired(false);
-    setPlayers({});
-    setSelectedHostId(null);
-    setHasAnalyzed(false);
 
     const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
     const db = getFirestore(app);
-    const sessionRef = doc(db, 'sessions', sessionId);
+    let active = true;
+    let unsubSession: () => void = () => {};
+    let unsubPlayers: () => void = () => {};
 
-    const unsubSession = onSnapshot(
-      sessionRef,
+    const stop = () => {
+      active = false;
+      unsubSession();
+      unsubPlayers();
+      if (stopListenersRef.current === stop) {
+        stopListenersRef.current = null;
+      }
+    };
+
+    const clearSessionData = () => {
+      setSessionLoading(false);
+      setSessionDoc(null);
+      setSessionExpired(false);
+      setPlayers({});
+      setSelectedHostId(null);
+      setHasAnalyzed(false);
+    };
+
+    const handleListenerError = (err: unknown) => {
+      if (!active) return;
+      stop();
+      clearSessionData();
+      setSessionError(
+        describeFirestoreError(
+          err,
+          'loading this session',
+          'Likely causes: you are not signed in, or the Firestore security rules are not published. Expired or deleted sessions show as not found instead.'
+        )
+      );
+    };
+
+    unsubSession = onSnapshot(
+      doc(db, 'sessions', sessionId),
       snap => {
-        setSessionLoading(false);
+        if (!active) return;
         if (!snap.exists()) {
+          stop();
+          clearSessionData();
           setSessionNotFound(true);
-          setSessionDoc(null);
-          setPlayers({});
-          setSelectedHostId(null);
-          setHasAnalyzed(false);
           return;
         }
+        setSessionLoading(false);
         const data = snap.data() as SessionDoc;
         setSessionDoc(data);
         if (data.expiresAt && data.expiresAt.toMillis() <= Date.now()) {
@@ -263,31 +338,24 @@ export default function App() {
           setSessionExpired(false);
         }
       },
-      () => {
-        setSessionLoading(false);
-        setSessionNotFound(true);
-      }
+      handleListenerError
     );
 
-    const playersRef = collection(db, 'sessions', sessionId, 'players');
-    const unsubPlayers = onSnapshot(
-      playersRef,
+    unsubPlayers = onSnapshot(
+      collection(db, 'sessions', sessionId, 'players'),
       snap => {
+        if (!active) return;
         const list: Record<string, Player> = {};
         snap.forEach(docSnap => {
           list[docSnap.id] = docSnap.data() as Player;
         });
         setPlayers(list);
       },
-      () => {
-        setPlayers({});
-      }
+      handleListenerError
     );
 
-    return () => {
-      unsubSession();
-      unsubPlayers();
-    };
+    stopListenersRef.current = stop;
+    return stop;
   }, [sessionId, currentUser]);
 
   const runNetworkBenchmark = useCallback(async () => {
@@ -396,7 +464,10 @@ export default function App() {
   }, []);
 
   const createNewSession = useCallback(async () => {
-    if (!currentUser) return;
+    if (!currentUser) {
+      setAppError('You are not signed in yet, so a session cannot be created. Wait a moment, or reload the page if this persists.');
+      return;
+    }
     const newId = generateCryptoSessionId();
     const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
     const db = getFirestore(app);
@@ -414,6 +485,7 @@ export default function App() {
       const url = new URL(window.location.href);
       url.searchParams.set('session', newId);
       window.history.pushState({}, '', url.toString());
+      setAppError('');
       setSessionId(newId);
       setSessionDoc({
         createdAt: Timestamp.fromMillis(now),
@@ -424,8 +496,14 @@ export default function App() {
       setSessionExpired(false);
       setHasAnalyzed(false);
       setSelectedHostId(null);
-    } catch (err: any) {
-      setAuthError(err.message || 'Failed to create session on Firestore.');
+    } catch (err) {
+      setAppError(
+        describeFirestoreError(
+          err,
+          'creating the session',
+          'Likely causes: the Firestore security rules are not published, or your device clock is set incorrectly.'
+        )
+      );
     }
   }, [currentUser]);
 
@@ -438,10 +516,18 @@ export default function App() {
     });
   }, [sessionId]);
 
-  const exitSession = useCallback(() => {
+  const exitSession = useCallback(async () => {
+    const leavingSessionId = sessionId;
+    const uid = currentUser?.uid;
+    if (stopListenersRef.current) {
+      stopListenersRef.current();
+    }
     const url = new URL(window.location.href);
     url.searchParams.delete('session');
-    window.history.pushState({}, '', url.pathname);
+    window.history.pushState({}, '', url.pathname + url.search + url.hash);
+    setSessionError('');
+    setAppError('');
+    setSessionLoading(false);
     setSessionId('');
     setSessionDoc(null);
     setPlayers({});
@@ -454,11 +540,21 @@ export default function App() {
     setLat(null);
     setLng(null);
     setCustomPings({});
-  }, []);
+    if (!leavingSessionId || !uid) return;
+    try {
+      const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+      await deleteDoc(doc(getFirestore(app), 'sessions', leavingSessionId, 'players', uid));
+    } catch {
+      setAppError('You left the session, but your player entry could not be removed. It may stay visible to others in that session until it expires and is deleted automatically.');
+    }
+  }, [sessionId, currentUser]);
 
   const handleJoinOrUpdate = useCallback(async () => {
+    if (!currentUser) {
+      setAppError('You are not signed in, so you cannot join this session. Reload the page to sign in again.');
+      return;
+    }
     if (
-      !currentUser ||
       !sessionId ||
       !name.trim() ||
       lat === null ||
@@ -504,8 +600,15 @@ export default function App() {
 
     try {
       await setDoc(playerRef, myPlayer);
-    } catch (err: any) {
-      setAuthError(err.message || 'Failed to update player entry in Firestore.');
+      setAppError('');
+    } catch (err) {
+      setAppError(
+        describeFirestoreError(
+          err,
+          'saving your player entry',
+          'Likely causes: the session has expired or was deleted, the Firestore security rules are not published, or your device clock is set incorrectly.'
+        )
+      );
     }
   }, [
     currentUser,
@@ -526,18 +629,29 @@ export default function App() {
   ]);
 
   const handleRemoveMyData = useCallback(async () => {
-    if (!currentUser || !sessionId) return;
+    if (!currentUser) {
+      setAppError('You are not signed in, so your player entry cannot be removed. Reload the page to sign in again.');
+      return;
+    }
+    if (!sessionId) return;
     const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
     const db = getFirestore(app);
     const playerRef = doc(db, 'sessions', sessionId, 'players', currentUser.uid);
     try {
       await deleteDoc(playerRef);
+      setAppError('');
       setName('');
       setCityName('');
       setLat(null);
       setLng(null);
-    } catch (err: any) {
-      setAuthError(err.message || 'Failed to remove player data.');
+    } catch (err) {
+      setAppError(
+        describeFirestoreError(
+          err,
+          'removing your player entry',
+          'Likely causes: you are not signed in as the user who created this entry, or the Firestore security rules are not published. The entry will be deleted automatically after it expires.'
+        )
+      );
     }
   }, [currentUser, sessionId]);
 
@@ -811,10 +925,10 @@ export default function App() {
         </div>
       </header>
 
-      {authError && (
+      {(authError || sessionError || appError) && (
         <div className="bg-rose-950/90 border-b border-rose-800 px-4 py-2.5 text-xs text-rose-200 flex items-center gap-2">
           <AlertTriangle className="w-4 h-4 text-rose-400 flex-shrink-0" />
-          <span>Firebase Error: {authError}</span>
+          <span>{authError || sessionError || appError}</span>
         </div>
       )}
 
@@ -822,7 +936,7 @@ export default function App() {
         <div className="bg-amber-950/80 border-b border-amber-800 px-4 py-2.5 text-xs text-amber-200 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-400" />
-            <span>This session has reached its 24-hour expiration limit and is no longer active.</span>
+            <span>This session has expired and is no longer active.</span>
           </div>
           <button
             onClick={createNewSession}
@@ -910,7 +1024,7 @@ export default function App() {
         </div>
 
         <div className="lg:col-span-5 xl:col-span-4 flex flex-col bg-slate-900/40 divide-y divide-slate-800 overflow-y-auto max-h-screen">
-          {!sessionId || sessionNotFound ? (
+          {!sessionId || sessionNotFound || sessionError ? (
             <div className="p-6 flex flex-col items-center text-center justify-center flex-1">
               <div className="w-16 h-16 rounded-2xl bg-cyan-950/70 border border-cyan-800 flex items-center justify-center mb-4 text-cyan-400 shadow-xl shadow-cyan-950/50">
                 <Globe2 className="w-8 h-8" />
@@ -927,7 +1041,7 @@ export default function App() {
                 <span>Create New Session</span>
               </button>
             </div>
-          ) : sessionLoading ? (
+          ) : sessionLoading || !currentUser ? (
             <div className="p-8 text-center text-slate-400 text-xs">Loading session data...</div>
           ) : (
             <>
