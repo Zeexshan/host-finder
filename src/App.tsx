@@ -1598,7 +1598,7 @@ export default function App() {
                 <div>
                   <h4 className="font-semibold text-emerald-300 mb-0.5">How Your Information is Handled</h4>
                   <p className="text-[11px] text-slate-300">
-                    Host Finder does not collect or store your IP address in Firestore. Only your chosen display name, self-reported connection details, and approximate coordinates are stored.
+                    Host Finder does not write your IP address to Firestore. When you join a session, your player entry stores your anonymous user ID, display name, city text, rounded coordinates, connection type, self-reported upload and download speeds, measured latency and jitter, PC strength, hosting preference, any Radmin ping values you enter, and join and expiry times. Anyone with the session link can see the entries in that session.
                   </p>
                 </div>
               </div>
@@ -1607,19 +1607,19 @@ export default function App() {
                 <h4 className="font-semibold text-slate-200">Security Architecture:</h4>
                 <ul className="list-disc list-inside space-y-1 text-slate-400 text-[11px]">
                   <li>
-                    <strong className="text-slate-300">City-Level Location Obfuscation:</strong> Coordinates are rounded to ~1 decimal place (~11 km radius). Exact residential addresses are not accepted or stored.
+                    <strong className="text-slate-300">City-Level Location Obfuscation:</strong> Coordinates from GPS or city search are rounded to 1 decimal place (about 11 km) before they are stored. The city field stores the text shown in it, so do not type a street address there.
                   </li>
                   <li>
-                    <strong className="text-slate-300">Firebase Anonymous Authentication:</strong> Each player is assigned an anonymous UID. Firestore Security Rules enforce that you can only edit or delete your own player document.
+                    <strong className="text-slate-300">Firebase Anonymous Authentication:</strong> Each browser is assigned an anonymous Firebase user ID. Firestore Security Rules only allow you to create, edit, or delete your own player entry.
                   </li>
                   <li>
-                    <strong className="text-slate-300">Automatic 24-Hour Expiration:</strong> Sessions are timestamped with a 24-hour expiration window.
+                    <strong className="text-slate-300">Expiry and Automatic Deletion:</strong> Sessions and player entries get an expiry time no more than 23 hours after they are created or last updated, and the security rules reject expiry times more than 24 hours ahead. Once a session expires, new player entries and updates are rejected. Expired sessions and player entries are deleted automatically after they expire; deletion is not immediate and may be delayed. Until then, entries remain readable to anyone with the session link.
                   </li>
                   <li>
-                    <strong className="text-slate-300">Network Transparency:</strong> Standard web requests (fetching Firestore, Open-Meteo geocoding, Cloudflare latency probes) connect your browser directly to those service providers over TLS.
+                    <strong className="text-slate-300">Network Transparency:</strong> Your browser connects directly over TLS to Netlify (this site), Google Firebase (sign-in and Firestore), Open-Meteo (city search), and Cloudflare and Google DNS (latency test). Like any web request, these providers receive your IP address.
                   </li>
                   <li>
-                    <strong className="text-slate-300">Data Deletion:</strong> Clicking &quot;Remove My Data&quot; deletes your document from the session subcollection immediately.
+                    <strong className="text-slate-300">Data Deletion:</strong> &quot;Remove My Data&quot; and &quot;Exit&quot; delete your player entry from the session. If deletion fails, the entry remains until it expires and is deleted automatically. The session record itself (creation and expiry times and the creator&apos;s anonymous user ID) cannot be deleted by users and is removed only after it expires.
                   </li>
                 </ul>
               </div>
