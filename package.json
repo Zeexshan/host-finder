@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test:rules": "tsc --noEmit tests/firestore-rules.test.ts"
+    "test:rules": "npx --yes firebase-tools@15.33.0 emulators:exec --only firestore --project demo-host-finder \"node --test tests/firestore-rules.test.ts\"",
+    "test:rules:run": "node --test tests/firestore-rules.test.ts"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
