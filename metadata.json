@@ -1,0 +1,6 @@
+{
+  "name": "Host Finder",
+  "description": "PC game host ping optimizer for Radmin VPN groups with real-time sync and 3D globe visualization.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
