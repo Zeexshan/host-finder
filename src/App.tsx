@@ -146,6 +146,8 @@ function calculateGreatCircleKm(lat1: number, lon1: number, lat2: number, lon2: 
   return R * c;
 }
 
+const CLIENT_EXPIRY_MS = 23 * 60 * 60 * 1000;
+
 function getErrorCode(err: unknown): string {
   if (err && typeof err === 'object' && typeof (err as { code?: unknown }).code === 'string') {
     return (err as { code: string }).code;
@@ -476,7 +478,7 @@ export default function App() {
     const now = Date.now();
     const docData = {
       createdAt: serverTimestamp(),
-      expiresAt: Timestamp.fromMillis(now + 24 * 60 * 60 * 1000),
+      expiresAt: Timestamp.fromMillis(now + CLIENT_EXPIRY_MS),
       createdBy: currentUser.uid
     };
 
@@ -489,7 +491,7 @@ export default function App() {
       setSessionId(newId);
       setSessionDoc({
         createdAt: Timestamp.fromMillis(now),
-        expiresAt: Timestamp.fromMillis(now + 24 * 60 * 60 * 1000),
+        expiresAt: Timestamp.fromMillis(now + CLIENT_EXPIRY_MS),
         createdBy: currentUser.uid
       });
       setSessionNotFound(false);
@@ -569,7 +571,7 @@ export default function App() {
     const db = getFirestore(app);
     const playerRef = doc(db, 'sessions', sessionId, 'players', currentUser.uid);
 
-    const maxExpiry = Date.now() + 24 * 60 * 60 * 1000;
+    const maxExpiry = Date.now() + CLIENT_EXPIRY_MS;
     const targetExpiry = sessionDoc?.expiresAt
       ? Math.min(sessionDoc.expiresAt.toMillis(), maxExpiry)
       : maxExpiry;
