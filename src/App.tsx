@@ -929,7 +929,7 @@ export default function App() {
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg bg-emerald-950/80 hover:bg-emerald-900 text-emerald-300 border border-emerald-800 transition"
           >
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="hidden sm:inline">Zero-IP Privacy Shield</span>
+            <span className="hidden sm:inline">Privacy info</span>
           </button>
         </div>
       </header>
