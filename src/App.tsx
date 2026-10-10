@@ -1,13 +1,10 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import * as THREE from 'three';
+import React, { useState, useEffect, useMemo, useCallback, Suspense, lazy } from 'react';
 import {
   Globe2,
   Copy,
   Check,
-  MapPin,
   Wifi,
   Cable,
-  Cpu,
   Gauge,
   Activity,
   AlertTriangle,
@@ -18,23 +15,27 @@ import {
   Info,
   Users,
   Compass,
-  Database,
   Radio,
   CheckCircle2,
   Sparkles,
   Search,
   Lock,
-  Layers,
-  Network
+  Layers
 } from 'lucide-react';
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getFirestore,
+  collection,
   doc,
   setDoc,
-  onSnapshot
+  deleteDoc,
+  onSnapshot,
+  Timestamp,
+  serverTimestamp
 } from 'firebase/firestore';
-import { getAuth, signInAnonymously } from 'firebase/auth';
+import { getAuth, signInAnonymously, onAuthStateChanged, User } from 'firebase/auth';
+
+const GlobeView = lazy(() => import('./GlobeView'));
 
 interface Player {
   id: string;
@@ -54,12 +55,10 @@ interface Player {
   joinedAt: number;
 }
 
-interface SessionData {
-  id: string;
-  createdAt: number;
-  expiresAt: number;
-  players: Record<string, Player>;
-  lastAnalyzedAt?: number;
+interface SessionDoc {
+  createdAt: Timestamp;
+  expiresAt: Timestamp;
+  createdBy: string;
 }
 
 interface GeocodingResult {
@@ -92,29 +91,24 @@ interface CandidateScore {
   explanation: string;
 }
 
-const STORAGE_SESSION_KEY = 'hostfinder_sessions';
-const STORAGE_USER_ID_KEY = 'hostfinder_user_id';
-const STORAGE_FIREBASE_CONFIG_KEY = 'hostfinder_firebase_cfg';
-const DEFAULT_FIREBASE_CONFIG = JSON.stringify(
-  {
-    apiKey: "AIzaSyAOJ96bDA7_IyZUfS7hwDsZPrbmDzlZFTg",
-    authDomain: "host-finder-985be.firebaseapp.com",
-    projectId: "host-finder-985be",
-    storageBucket: "host-finder-985be.firebasestorage.app",
-    messagingSenderId: "65478399967",
-    appId: "1:65478399967:web:e0c8bdca3cc469fce7566a"
-  },
-  null,
-  2
-);
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyAOJ96bDA7_IyZUfS7hwDsZPrbmDzlZFTg",
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "host-finder-985be.firebaseapp.com",
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "host-finder-985be",
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "host-finder-985be.firebasestorage.app",
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "65478399967",
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || "1:65478399967:web:e0c8bdca3cc469fce7566a"
+};
 
-function getOrCreateUserId(): string {
-  let uid = localStorage.getItem(STORAGE_USER_ID_KEY);
-  if (!uid) {
-    uid = 'user_' + Math.random().toString(36).substring(2, 10);
-    localStorage.setItem(STORAGE_USER_ID_KEY, uid);
+function generateCryptoSessionId(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
+  const array = new Uint8Array(16);
+  crypto.getRandomValues(array);
+  let result = '';
+  for (let i = 0; i < 16; i++) {
+    result += chars[array[i] % chars.length];
   }
-  return uid;
+  return result;
 }
 
 function roundCoord(val: number): number {
@@ -148,159 +142,21 @@ function calculateEstimatedPing(p1: Player, p2: Player): { ping: number; isMeasu
   return { ping: Math.max(5, est), isMeasured: false };
 }
 
-function createRealisticEarthTexture(): THREE.CanvasTexture {
-  const width = 2048;
-  const height = 1024;
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return new THREE.CanvasTexture(canvas);
-
-  const oceanGrad = ctx.createLinearGradient(0, 0, 0, height);
-  oceanGrad.addColorStop(0, '#030816');
-  oceanGrad.addColorStop(0.3, '#08172e');
-  oceanGrad.addColorStop(0.5, '#0a1d38');
-  oceanGrad.addColorStop(0.7, '#08172e');
-  oceanGrad.addColorStop(1, '#030816');
-  ctx.fillStyle = oceanGrad;
-  ctx.fillRect(0, 0, width, height);
-
-  ctx.strokeStyle = '#0f294a';
-  ctx.lineWidth = 1;
-  for (let lat = -75; lat <= 75; lat += 15) {
-    const y = ((90 - lat) / 180) * height;
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(width, y);
-    ctx.stroke();
-  }
-  for (let lon = -180; lon <= 180; lon += 15) {
-    const x = ((lon + 180) / 360) * width;
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, height);
-    ctx.stroke();
-  }
-
-  ctx.strokeStyle = '#1e3a8a';
-  ctx.lineWidth = 2;
-  const eqY = height / 2;
-  ctx.beginPath();
-  ctx.moveTo(0, eqY);
-  ctx.lineTo(width, eqY);
-  ctx.stroke();
-
-  const toX = (lon: number) => ((lon + 180) / 360) * width;
-  const toY = (lat: number) => ((90 - lat) / 180) * height;
-
-  const continents = [
-    [
-      [-168, 65], [-160, 71], [-140, 70], [-120, 75], [-85, 78], [-60, 60], [-65, 45],
-      [-75, 35], [-80, 25], [-90, 20], [-97, 18], [-105, 20], [-115, 30], [-125, 40],
-      [-125, 50], [-140, 60], [-168, 65]
-    ],
-    [
-      [-55, 83], [-20, 83], [-25, 65], [-45, 60], [-55, 75], [-55, 83]
-    ],
-    [
-      [-80, 10], [-60, 12], [-50, -5], [-35, -5], [-38, -15], [-55, -25], [-65, -45],
-      [-70, -55], [-75, -50], [-72, -35], [-80, -5], [-80, 10]
-    ],
-    [
-      [-10, 36], [0, 42], [5, 48], [-4, 48], [2, 51], [8, 55], [20, 60], [28, 70],
-      [15, 68], [5, 62], [10, 54], [12, 45], [20, 40], [25, 38], [15, 38], [-5, 36], [-10, 36]
-    ],
-    [
-      [-5, 58], [2, 52], [-5, 50], [-4, 58]
-    ],
-    [
-      [-17, 30], [-17, 20], [-10, 5], [5, 5], [10, -5], [12, -18], [20, -34], [30, -34],
-      [35, -20], [40, -10], [51, 12], [45, 12], [32, 30], [10, 37], [-5, 36], [-17, 30]
-    ],
-    [
-      [45, -12], [50, -14], [48, -25], [44, -25], [45, -12]
-    ],
-    [
-      [28, 70], [60, 75], [100, 77], [140, 75], [170, 68], [170, 60], [140, 50],
-      [130, 40], [120, 35], [120, 22], [110, 20], [105, 10], [100, 5], [98, 15],
-      [80, 15], [70, 25], [60, 25], [50, 25], [40, 15], [35, 30], [28, 40], [30, 55], [28, 70]
-    ],
-    [
-      [70, 22], [80, 20], [88, 22], [80, 8], [75, 10], [70, 22]
-    ],
-    [
-      [130, 32], [140, 36], [142, 44], [135, 35], [130, 32]
-    ],
-    [
-      [114, -22], [125, -15], [135, -12], [145, -15], [152, -25], [150, -35], [140, -38],
-      [130, -32], [115, -34], [114, -22]
-    ],
-    [
-      [168, -35], [178, -38], [172, -45], [168, -35]
-    ],
-    [
-      [-180, -70], [-100, -72], [-60, -65], [0, -70], [60, -68], [120, -65], [180, -70],
-      [180, -85], [-180, -85], [-180, -70]
-    ]
-  ];
-
-  continents.forEach(poly => {
-    ctx.fillStyle = '#064e3b';
-    ctx.strokeStyle = '#38bdf8';
-    ctx.lineWidth = 1.5;
-
-    ctx.beginPath();
-    poly.forEach((pt, idx) => {
-      const x = toX(pt[0]);
-      const y = toY(pt[1]);
-      if (idx === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.fillStyle = '#047857';
-    ctx.beginPath();
-    poly.forEach((pt, idx) => {
-      const x = toX(pt[0]);
-      const y = toY(pt[1]);
-      if (idx === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-    });
-    ctx.closePath();
-    ctx.fill();
-  });
-
-  const cityLights = [
-    [-74, 40.7], [-118, 34], [-0.1, 51.5], [2.3, 48.8], [13.4, 52.5],
-    [37.6, 55.7], [77.2, 28.6], [72.8, 19], [121.5, 31.2], [116.4, 39.9],
-    [139.7, 35.7], [151.2, -33.8], [-46.6, -23.5], [18.4, -33.9], [55.3, 25.2]
-  ];
-
-  ctx.fillStyle = '#fef08a';
-  cityLights.forEach(cl => {
-    const cx = toX(cl[0]);
-    const cy = toY(cl[1]);
-    ctx.beginPath();
-    ctx.arc(cx, cy, 3, 0, Math.PI * 2);
-    ctx.fill();
-  });
-
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.wrapS = THREE.RepeatWrapping;
-  tex.wrapT = THREE.ClampToEdgeWrapping;
-  return tex;
-}
-
 export default function App() {
-  const currentUserId = useMemo(() => getOrCreateUserId(), []);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authError, setAuthError] = useState<string>('');
+
   const [sessionId, setSessionId] = useState<string>(() => {
     const params = new URLSearchParams(window.location.search);
     return params.get('session') || '';
   });
-  const [session, setSession] = useState<SessionData | null>(null);
+  const [sessionDoc, setSessionDoc] = useState<SessionDoc | null>(null);
+  const [sessionLoading, setSessionLoading] = useState<boolean>(false);
+  const [sessionNotFound, setSessionNotFound] = useState<boolean>(false);
+  const [sessionExpired, setSessionExpired] = useState<boolean>(false);
+
+  const [players, setPlayers] = useState<Record<string, Player>>({});
+
   const [rankingMode, setRankingMode] = useState<'central' | 'minimize_max' | 'best_avg'>('central');
   const [isCopied, setIsCopied] = useState<boolean>(false);
   const [hasAnalyzed, setHasAnalyzed] = useState<boolean>(false);
@@ -313,85 +169,138 @@ export default function App() {
   const [connectionType, setConnectionType] = useState<'wired' | 'wifi'>('wired');
   const [uploadMbps, setUploadMbps] = useState<number>(50);
   const [downloadMbps, setDownloadMbps] = useState<number>(150);
-  const [latencyMs, setLatencyMs] = useState<number>(20);
-  const [jitterMs, setJitterMs] = useState<number>(2);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [jitterMs, setJitterMs] = useState<number | null>(null);
   const [pcStrength, setPcStrength] = useState<'low' | 'medium' | 'high'>('high');
   const [canHost, setCanHost] = useState<'yes' | 'no' | 'only_if_needed'>('yes');
   const [customPings, setCustomPings] = useState<Record<string, number>>({});
 
   const [isTestingNet, setIsTestingNet] = useState<boolean>(false);
-  const [netTestDone, setNetTestDone] = useState<boolean>(false);
+  const [netTestError, setNetTestError] = useState<string>('');
   const [geoSearching, setGeoSearching] = useState<boolean>(false);
   const [geoResults, setGeoResults] = useState<GeocodingResult[]>([]);
   const [geoError, setGeoError] = useState<string>('');
   const [isLocating, setIsLocating] = useState<boolean>(false);
   const [locatingError, setLocatingError] = useState<string>('');
-
-  const [firebaseConfigStr, setFirebaseConfigStr] = useState<string>(() => {
-    return localStorage.getItem(STORAGE_FIREBASE_CONFIG_KEY) || DEFAULT_FIREBASE_CONFIG;
-  });
-  const [isFirebaseConnected, setIsFirebaseConnected] = useState<boolean>(false);
   const [showSecurityModal, setShowSecurityModal] = useState<boolean>(false);
-  const [syncStatus, setSyncStatus] = useState<'local' | 'firebase' | 'connecting'>('connecting');
 
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const threeStateRef = useRef<{
-    renderer?: THREE.WebGLRenderer;
-    scene?: THREE.Scene;
-    camera?: THREE.PerspectiveCamera;
-    globe?: THREE.Mesh;
-    dotsGroup?: THREE.Group;
-    arcsGroup?: THREE.Group;
-    starMesh?: THREE.Points;
-    reqId?: number;
-    isDragging: boolean;
-    prevMouseX: number;
-    prevMouseY: number;
-    targetRotY: number;
-    targetRotX: number;
-    cameraDistance: number;
-  }>({
-    isDragging: false,
-    prevMouseX: 0,
-    prevMouseY: 0,
-    targetRotY: 0,
-    targetRotX: 0.2,
-    cameraDistance: 6.5
-  });
+  useEffect(() => {
+    try {
+      const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+      const auth = getAuth(app);
+      const unsubscribe = onAuthStateChanged(auth, user => {
+        if (user) {
+          setCurrentUser(user);
+          setAuthError('');
+        } else {
+          signInAnonymously(auth).catch(err => {
+            setAuthError(err.message || 'Firebase anonymous sign-in failed');
+          });
+        }
+      });
+      return () => unsubscribe();
+    } catch (err: any) {
+      setAuthError(err.message || 'Firebase initialization failed');
+    }
+  }, []);
 
-  const [screenNodes, setScreenNodes] = useState<{ id: string; name: string; x: number; y: number; visible: boolean; isHost: boolean }[]>([]);
+  useEffect(() => {
+    if (!sessionId || !currentUser) {
+      setSessionDoc(null);
+      setSessionNotFound(false);
+      setSessionExpired(false);
+      return;
+    }
+
+    setSessionLoading(true);
+    setSessionNotFound(false);
+    setSessionExpired(false);
+
+    const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const sessionRef = doc(db, 'sessions', sessionId);
+
+    const unsubSession = onSnapshot(
+      sessionRef,
+      snap => {
+        setSessionLoading(false);
+        if (!snap.exists()) {
+          setSessionNotFound(true);
+          setSessionDoc(null);
+          return;
+        }
+        const data = snap.data() as SessionDoc;
+        setSessionDoc(data);
+        if (data.expiresAt && data.expiresAt.toMillis() <= Date.now()) {
+          setSessionExpired(true);
+        } else {
+          setSessionExpired(false);
+        }
+      },
+      () => {
+        setSessionLoading(false);
+        setSessionNotFound(true);
+      }
+    );
+
+    const playersRef = collection(db, 'sessions', sessionId, 'players');
+    const unsubPlayers = onSnapshot(
+      playersRef,
+      snap => {
+        const list: Record<string, Player> = {};
+        snap.forEach(docSnap => {
+          list[docSnap.id] = docSnap.data() as Player;
+        });
+        setPlayers(list);
+      },
+      () => {
+        setPlayers({});
+      }
+    );
+
+    return () => {
+      unsubSession();
+      unsubPlayers();
+    };
+  }, [sessionId, currentUser]);
 
   const runNetworkBenchmark = useCallback(async () => {
     setIsTestingNet(true);
+    setNetTestError('');
     const times: number[] = [];
     const endpoints = [
       'https://cloudflare.com/cdn-cgi/trace',
       'https://1.1.1.1/cdn-cgi/trace',
       'https://dns.google/resolve?name=example.com'
     ];
-    for (let i = 0; i < 4; i++) {
-      const ep = endpoints[i % endpoints.length];
+
+    for (let i = 0; i < endpoints.length; i++) {
+      const ep = endpoints[i];
       const start = performance.now();
       try {
         await fetch(ep, { mode: 'no-cors', cache: 'no-store' });
         times.push(performance.now() - start);
       } catch {
-        times.push(30 + Math.random() * 20);
+        // network failure
       }
     }
+
+    setIsTestingNet(false);
+
+    if (times.length === 0) {
+      setNetTestError('Network probe failed. Endpoints unreachable.');
+      return;
+    }
+
     const avg = Math.round(times.reduce((a, b) => a + b, 0) / times.length);
     let diffSum = 0;
     for (let i = 1; i < times.length; i++) {
       diffSum += Math.abs(times[i] - times[i - 1]);
     }
-    const computedJitter = Math.max(1, Math.round(diffSum / (times.length - 1)));
+    const computedJitter = times.length > 1 ? Math.max(1, Math.round(diffSum / (times.length - 1))) : 2;
 
-    setLatencyMs(Math.max(8, Math.min(250, avg)));
-    setJitterMs(Math.max(1, Math.min(50, computedJitter)));
-    setUploadMbps(prev => (prev === 50 ? 60 : prev));
-    setDownloadMbps(prev => (prev === 150 ? 180 : prev));
-    setIsTestingNet(false);
-    setNetTestDone(true);
+    setLatencyMs(avg);
+    setJitterMs(computedJitter);
   }, []);
 
   const handleCitySearch = useCallback(async (query: string) => {
@@ -460,183 +369,39 @@ export default function App() {
     );
   }, []);
 
-  useEffect(() => {
-    if (!firebaseConfigStr.trim()) {
-      setIsFirebaseConnected(false);
-      setSyncStatus('local');
-      return;
-    }
-    try {
-      const parsed = JSON.parse(firebaseConfigStr);
-      const app = getApps().length > 0 ? getApp() : initializeApp(parsed);
-      const auth = getAuth(app);
-      const db = getFirestore(app);
-      signInAnonymously(auth)
-        .then(() => {
-          setIsFirebaseConnected(true);
-          setSyncStatus('firebase');
-        })
-        .catch(() => {
-          setIsFirebaseConnected(false);
-          setSyncStatus('local');
-        });
-    } catch {
-      setIsFirebaseConnected(false);
-      setSyncStatus('local');
-    }
-  }, [firebaseConfigStr]);
+  const createNewSession = useCallback(async () => {
+    if (!currentUser) return;
+    const newId = generateCryptoSessionId();
+    const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const sessionRef = doc(db, 'sessions', newId);
 
-  const saveFirebaseConfig = useCallback((val: string) => {
-    setFirebaseConfigStr(val);
-    localStorage.setItem(STORAGE_FIREBASE_CONFIG_KEY, val);
-  }, []);
-
-  useEffect(() => {
-    if (!sessionId) {
-      setSession(null);
-      return;
-    }
-
-    if (isFirebaseConnected && firebaseConfigStr.trim()) {
-      try {
-        const app = getApps().length > 0 ? getApp() : initializeApp(JSON.parse(firebaseConfigStr));
-        const db = getFirestore(app);
-        const sessionRef = doc(db, 'sessions', sessionId);
-        const unsub = onSnapshot(sessionRef, snap => {
-          if (snap.exists()) {
-            setSession(snap.data() as SessionData);
-          } else {
-            const now = Date.now();
-            const initial: SessionData = {
-              id: sessionId,
-              createdAt: now,
-              expiresAt: now + 24 * 60 * 60 * 1000,
-              players: {}
-            };
-            setDoc(sessionRef, initial);
-            setSession(initial);
-          }
-        });
-        return () => unsub();
-      } catch {
-        setSyncStatus('local');
-      }
-    }
-
-    const loadLocal = () => {
-      try {
-        const raw = localStorage.getItem(STORAGE_SESSION_KEY);
-        const map: Record<string, SessionData> = raw ? JSON.parse(raw) : {};
-        let current = map[sessionId];
-        const now = Date.now();
-        if (!current) {
-          current = {
-            id: sessionId,
-            createdAt: now,
-            expiresAt: now + 24 * 60 * 60 * 1000,
-            players: {}
-          };
-          map[sessionId] = current;
-          localStorage.setItem(STORAGE_SESSION_KEY, JSON.stringify(map));
-        }
-        setSession(current);
-      } catch {
-        // storage fallback
-      }
-    };
-
-    loadLocal();
-    const interval = setInterval(loadLocal, 2000);
-    const channel = new BroadcastChannel('hostfinder_sync_' + sessionId);
-    channel.onmessage = e => {
-      if (e.data && e.data.sessionId === sessionId) {
-        loadLocal();
-      }
-    };
-
-    return () => {
-      clearInterval(interval);
-      channel.close();
-    };
-  }, [sessionId, isFirebaseConnected, firebaseConfigStr]);
-
-  const updateSessionData = useCallback(
-    async (updater: (prev: SessionData) => SessionData) => {
-      if (!sessionId) return;
-      if (isFirebaseConnected && firebaseConfigStr.trim()) {
-        try {
-          const app = getApps().length > 0 ? getApp() : initializeApp(JSON.parse(firebaseConfigStr));
-          const db = getFirestore(app);
-          const sessionRef = doc(db, 'sessions', sessionId);
-          setSession(prev => {
-            const next = updater(
-              prev || {
-                id: sessionId,
-                createdAt: Date.now(),
-                expiresAt: Date.now() + 24 * 60 * 60 * 1000,
-                players: {}
-              }
-            );
-            setDoc(sessionRef, next);
-            return next;
-          });
-          return;
-        } catch {
-          // fallback
-        }
-      }
-
-      try {
-        const raw = localStorage.getItem(STORAGE_SESSION_KEY);
-        const map: Record<string, SessionData> = raw ? JSON.parse(raw) : {};
-        const current = map[sessionId] || {
-          id: sessionId,
-          createdAt: Date.now(),
-          expiresAt: Date.now() + 24 * 60 * 60 * 1000,
-          players: {}
-        };
-        const next = updater(current);
-        map[sessionId] = next;
-        localStorage.setItem(STORAGE_SESSION_KEY, JSON.stringify(map));
-        setSession(next);
-        const channel = new BroadcastChannel('hostfinder_sync_' + sessionId);
-        channel.postMessage({ sessionId, timestamp: Date.now() });
-        channel.close();
-      } catch {
-        // fallback
-      }
-    },
-    [sessionId, isFirebaseConnected, firebaseConfigStr]
-  );
-
-  const createNewSession = useCallback(() => {
-    const rand = Math.random().toString(36).substring(2, 8) + Math.random().toString(36).substring(2, 6);
-    const newId = 'hf-' + rand;
     const now = Date.now();
-    const newSession: SessionData = {
-      id: newId,
-      createdAt: now,
-      expiresAt: now + 24 * 60 * 60 * 1000,
-      players: {}
+    const docData = {
+      createdAt: serverTimestamp(),
+      expiresAt: Timestamp.fromMillis(now + 24 * 60 * 60 * 1000),
+      createdBy: currentUser.uid
     };
 
     try {
-      const raw = localStorage.getItem(STORAGE_SESSION_KEY);
-      const map: Record<string, SessionData> = raw ? JSON.parse(raw) : {};
-      map[newId] = newSession;
-      localStorage.setItem(STORAGE_SESSION_KEY, JSON.stringify(map));
-    } catch {
-      // storage
+      await setDoc(sessionRef, docData);
+      const url = new URL(window.location.href);
+      url.searchParams.set('session', newId);
+      window.history.pushState({}, '', url.toString());
+      setSessionId(newId);
+      setSessionDoc({
+        createdAt: Timestamp.fromMillis(now),
+        expiresAt: Timestamp.fromMillis(now + 24 * 60 * 60 * 1000),
+        createdBy: currentUser.uid
+      });
+      setSessionNotFound(false);
+      setSessionExpired(false);
+      setHasAnalyzed(false);
+      setSelectedHostId(null);
+    } catch (err: any) {
+      setAuthError(err.message || 'Failed to create session on Firestore.');
     }
-
-    const url = new URL(window.location.href);
-    url.searchParams.set('session', newId);
-    window.history.pushState({}, '', url.toString());
-    setSessionId(newId);
-    setSession(newSession);
-    setHasAnalyzed(false);
-    setSelectedHostId(null);
-  }, []);
+  }, [currentUser]);
 
   const copyMagicLink = useCallback(() => {
     const url = new URL(window.location.href);
@@ -647,34 +412,39 @@ export default function App() {
     });
   }, [sessionId]);
 
-  const handleJoinOrUpdate = useCallback(() => {
-    if (!name.trim() || lat === null || lng === null) return;
+  const handleJoinOrUpdate = useCallback(async () => {
+    if (!currentUser || !sessionId || !name.trim() || lat === null || lng === null) return;
+    const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const playerRef = doc(db, 'sessions', sessionId, 'players', currentUser.uid);
+
+    const cleanName = name.trim().slice(0, 24);
     const myPlayer: Player = {
-      id: currentUserId,
-      userId: currentUserId,
-      name: name.trim(),
-      cityName: cityName.trim() || 'Approximate City Area',
+      id: currentUser.uid,
+      userId: currentUser.uid,
+      name: cleanName,
+      cityName: cityName.trim().slice(0, 60) || 'Approximate City Area',
       lat,
       lng,
       connectionType,
-      uploadMbps: Math.max(1, uploadMbps),
-      downloadMbps: Math.max(1, downloadMbps),
-      latencyMs: Math.max(1, latencyMs),
-      jitterMs: Math.max(1, jitterMs),
+      uploadMbps: Math.max(1, Math.min(2000, uploadMbps)),
+      downloadMbps: Math.max(1, Math.min(2000, downloadMbps)),
+      latencyMs: latencyMs !== null ? Math.max(0, Math.min(1000, latencyMs)) : 20,
+      jitterMs: jitterMs !== null ? Math.max(0, Math.min(500, jitterMs)) : 2,
       pcStrength,
       canHost,
       radminPings: customPings,
       joinedAt: Date.now()
     };
 
-    updateSessionData(prev => ({
-      ...prev,
-      players: {
-        ...prev.players,
-        [currentUserId]: myPlayer
-      }
-    }));
+    try {
+      await setDoc(playerRef, myPlayer);
+    } catch (err: any) {
+      setAuthError(err.message || 'Failed to update player entry in Firestore.');
+    }
   }, [
+    currentUser,
+    sessionId,
     name,
     cityName,
     lat,
@@ -686,35 +456,33 @@ export default function App() {
     jitterMs,
     pcStrength,
     canHost,
-    customPings,
-    currentUserId,
-    updateSessionData
+    customPings
   ]);
 
-  const handleRemoveMyData = useCallback(() => {
-    updateSessionData(prev => {
-      const copy = { ...prev.players };
-      delete copy[currentUserId];
-      return {
-        ...prev,
-        players: copy
-      };
-    });
-    setName('');
-    setCityName('');
-    setLat(null);
-    setLng(null);
-  }, [currentUserId, updateSessionData]);
+  const handleRemoveMyData = useCallback(async () => {
+    if (!currentUser || !sessionId) return;
+    const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const playerRef = doc(db, 'sessions', sessionId, 'players', currentUser.uid);
+    try {
+      await deleteDoc(playerRef);
+      setName('');
+      setCityName('');
+      setLat(null);
+      setLng(null);
+    } catch (err: any) {
+      setAuthError(err.message || 'Failed to remove player data.');
+    }
+  }, [currentUser, sessionId]);
 
   const playersList = useMemo(() => {
-    if (!session || !session.players) return [];
-    return Object.values(session.players);
-  }, [session]);
+    return Object.values(players);
+  }, [players]);
 
   const currentPlayer = useMemo(() => {
-    if (!session || !session.players) return null;
-    return session.players[currentUserId] || null;
-  }, [session, currentUserId]);
+    if (!currentUser) return null;
+    return players[currentUser.uid] || null;
+  }, [players, currentUser]);
 
   useEffect(() => {
     if (currentPlayer) {
@@ -910,296 +678,19 @@ export default function App() {
     }
   }, [recommendedHost, selectedHostId]);
 
-  const isSessionExpired = useMemo(() => {
-    if (!session) return false;
-    return Date.now() > session.expiresAt;
-  }, [session]);
-
   const activeHost = useMemo(() => {
-    if (selectedHostId && session && session.players[selectedHostId]) {
-      return session.players[selectedHostId];
+    if (selectedHostId && players[selectedHostId]) {
+      return players[selectedHostId];
     }
     return recommendedHost?.player || null;
-  }, [selectedHostId, session, recommendedHost]);
+  }, [selectedHostId, players, recommendedHost]);
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
-
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x020617);
-
-    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
-    camera.position.z = threeStateRef.current.cameraDistance;
-
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, powerPreference: 'high-performance' });
-    renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
-    scene.add(ambientLight);
-
-    const sunLight = new THREE.DirectionalLight(0xe0f2fe, 1.4);
-    sunLight.position.set(6, 4, 6);
-    scene.add(sunLight);
-
-    const fillLight = new THREE.DirectionalLight(0x38bdf8, 0.5);
-    fillLight.position.set(-6, -3, -6);
-    scene.add(fillLight);
-
-    const starGeo = new THREE.BufferGeometry();
-    const starCount = 1500;
-    const starPositions = new Float32Array(starCount * 3);
-    for (let i = 0; i < starCount * 3; i += 3) {
-      starPositions[i] = (Math.random() - 0.5) * 100;
-      starPositions[i + 1] = (Math.random() - 0.5) * 100;
-      starPositions[i + 2] = (Math.random() - 0.5) * 100;
-    }
-    starGeo.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
-    const starMat = new THREE.PointsMaterial({
-      color: 0x94a3b8,
-      size: 0.16,
-      transparent: true,
-      opacity: 0.85
-    });
-    const starPoints = new THREE.Points(starGeo, starMat);
-    scene.add(starPoints);
-
-    const globeRadius = 2.0;
-    const globeGeo = new THREE.SphereGeometry(globeRadius, 64, 64);
-    const earthTexture = createRealisticEarthTexture();
-
-    const globeMat = new THREE.MeshStandardMaterial({
-      map: earthTexture,
-      roughness: 0.55,
-      metalness: 0.15
-    });
-    const globe = new THREE.Mesh(globeGeo, globeMat);
-    scene.add(globe);
-
-    const atmosphereGeo = new THREE.SphereGeometry(globeRadius * 1.04, 48, 48);
-    const atmosphereMat = new THREE.MeshBasicMaterial({
-      color: 0x38bdf8,
-      transparent: true,
-      opacity: 0.15,
-      side: THREE.BackSide
-    });
-    const atmosphere = new THREE.Mesh(atmosphereGeo, atmosphereMat);
-    scene.add(atmosphere);
-
-    const dotsGroup = new THREE.Group();
-    scene.add(dotsGroup);
-
-    const arcsGroup = new THREE.Group();
-    scene.add(arcsGroup);
-
-    threeStateRef.current = {
-      renderer,
-      scene,
-      camera,
-      globe,
-      dotsGroup,
-      arcsGroup,
-      starMesh: starPoints,
-      isDragging: false,
-      prevMouseX: 0,
-      prevMouseY: 0,
-      targetRotY: 0,
-      targetRotX: 0.2,
-      cameraDistance: 6.5
-    };
-
-    const animate = () => {
-      const st = threeStateRef.current;
-      if (!st.isDragging && globe) {
-        st.targetRotY += 0.0018;
-      }
-
-      if (globe && dotsGroup && arcsGroup) {
-        globe.rotation.y = THREE.MathUtils.lerp(globe.rotation.y, st.targetRotY, 0.08);
-        globe.rotation.x = THREE.MathUtils.lerp(globe.rotation.x, st.targetRotX, 0.08);
-        dotsGroup.rotation.y = globe.rotation.y;
-        dotsGroup.rotation.x = globe.rotation.x;
-        arcsGroup.rotation.y = globe.rotation.y;
-        arcsGroup.rotation.x = globe.rotation.x;
-      }
-
-      renderer.render(scene, camera);
-
-      if (canvas && camera && dotsGroup) {
-        const rect = canvas.getBoundingClientRect();
-        const updatedScreenNodes: typeof screenNodes = [];
-        dotsGroup.children.forEach(child => {
-          if (child.userData && child.userData.playerId) {
-            const worldPos = new THREE.Vector3();
-            child.getWorldPosition(worldPos);
-            const proj = worldPos.clone().project(camera);
-            const isBehind = proj.z > 1.0 || worldPos.dot(camera.position) < -0.1;
-            const x = ((proj.x + 1) / 2) * rect.width;
-            const y = ((-proj.y + 1) / 2) * rect.height;
-            updatedScreenNodes.push({
-              id: child.userData.playerId,
-              name: child.userData.playerName,
-              x,
-              y,
-              visible: !isBehind && proj.z < 1.0,
-              isHost: child.userData.isHost
-            });
-          }
-        });
-        setScreenNodes(updatedScreenNodes);
-      }
-
-      threeStateRef.current.reqId = requestAnimationFrame(animate);
-    };
-
-    threeStateRef.current.reqId = requestAnimationFrame(animate);
-
-    const handleResize = () => {
-      if (!canvas) return;
-      const w = canvas.clientWidth;
-      const h = canvas.clientHeight;
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
-    };
-    window.addEventListener('resize', handleResize);
-
-    return () => {
-      window.removeEventListener('resize', handleResize);
-      if (threeStateRef.current.reqId) cancelAnimationFrame(threeStateRef.current.reqId);
-      renderer.dispose();
-      globeGeo.dispose();
-      globeMat.dispose();
-      earthTexture.dispose();
-      atmosphereGeo.dispose();
-      atmosphereMat.dispose();
-      starGeo.dispose();
-      starMat.dispose();
-    };
-  }, []);
-
-  const latLngToVector3 = useCallback((latitude: number, longitude: number, radius = 2.0) => {
-    const phi = ((90 - latitude) * Math.PI) / 180;
-    const theta = ((longitude + 180) * Math.PI) / 180;
-    const x = -radius * Math.sin(phi) * Math.cos(theta);
-    const z = radius * Math.sin(phi) * Math.sin(theta);
-    const y = radius * Math.cos(phi);
-    return new THREE.Vector3(x, y, z);
-  }, []);
-
-  useEffect(() => {
-    const { dotsGroup, arcsGroup } = threeStateRef.current;
-    if (!dotsGroup || !arcsGroup) return;
-
-    while (dotsGroup.children.length > 0) {
-      const obj = dotsGroup.children[0] as THREE.Mesh;
-      if (obj.geometry) obj.geometry.dispose();
-      dotsGroup.remove(obj);
-    }
-    while (arcsGroup.children.length > 0) {
-      const obj = arcsGroup.children[0] as THREE.Line;
-      if (obj.geometry) obj.geometry.dispose();
-      arcsGroup.remove(obj);
-    }
-
-    const hostId = activeHost ? activeHost.id : null;
-
-    playersList.forEach(player => {
-      const pos = latLngToVector3(player.lat, player.lng, 2.02);
-      const isHost = player.id === hostId;
-
-      const pinGeo = new THREE.SphereGeometry(isHost ? 0.085 : 0.05, 16, 16);
-      const pinMat = new THREE.MeshBasicMaterial({
-        color: isHost ? 0xf59e0b : 0x06b6d4
-      });
-      const pinMesh = new THREE.Mesh(pinGeo, pinMat);
-      pinMesh.position.copy(pos);
-      pinMesh.userData = {
-        playerId: player.id,
-        playerName: player.name,
-        isHost
-      };
-      dotsGroup.add(pinMesh);
-
-      const ringGeo = new THREE.RingGeometry(isHost ? 0.09 : 0.06, isHost ? 0.13 : 0.085, 24);
-      const ringMat = new THREE.MeshBasicMaterial({
-        color: isHost ? 0xfbbf24 : 0x22d3ee,
-        side: THREE.DoubleSide,
-        transparent: true,
-        opacity: 0.85
-      });
-      const ringMesh = new THREE.Mesh(ringGeo, ringMat);
-      ringMesh.position.copy(pos.clone().multiplyScalar(1.002));
-      ringMesh.lookAt(new THREE.Vector3(0, 0, 0));
-      dotsGroup.add(ringMesh);
-    });
-
-    if (hasAnalyzed && activeHost && playersList.length >= 2) {
-      const hostPos = latLngToVector3(activeHost.lat, activeHost.lng, 2.03);
-
-      playersList.forEach(player => {
-        if (player.id === activeHost.id) return;
-        const targetPos = latLngToVector3(player.lat, player.lng, 2.03);
-
-        const { ping } = calculateEstimatedPing(activeHost, player);
-
-        let arcColor = 0x22c55e;
-        if (ping > 60 && ping <= 120) arcColor = 0xeab308;
-        if (ping > 120) arcColor = 0xef4444;
-
-        const mid = hostPos.clone().add(targetPos).multiplyScalar(0.5);
-        const dist = hostPos.distanceTo(targetPos);
-        const altitude = 2.0 + Math.max(0.4, dist * 0.45);
-        mid.normalize().multiplyScalar(altitude);
-
-        const curve = new THREE.QuadraticBezierCurve3(hostPos, mid, targetPos);
-        const points = curve.getPoints(40);
-        const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
-        const lineMat = new THREE.LineBasicMaterial({
-          color: arcColor,
-          linewidth: 2,
-          transparent: true,
-          opacity: 0.85
-        });
-        const line = new THREE.Line(lineGeo, lineMat);
-        arcsGroup.add(line);
-      });
-    }
-  }, [playersList, activeHost, hasAnalyzed, latLngToVector3]);
-
-  const handlePointerDown = (e: React.PointerEvent) => {
-    const st = threeStateRef.current;
-    st.isDragging = true;
-    st.prevMouseX = e.clientX;
-    st.prevMouseY = e.clientY;
-  };
-
-  const handlePointerMove = (e: React.PointerEvent) => {
-    const st = threeStateRef.current;
-    if (!st.isDragging) return;
-    const dx = e.clientX - st.prevMouseX;
-    const dy = e.clientY - st.prevMouseY;
-    st.prevMouseX = e.clientX;
-    st.prevMouseY = e.clientY;
-    st.targetRotY += dx * 0.006;
-    st.targetRotX = Math.max(-1.2, Math.min(1.2, st.targetRotX + dy * 0.006));
-  };
-
-  const handlePointerUp = () => {
-    threeStateRef.current.isDragging = false;
-  };
-
-  const handleWheel = (e: React.WheelEvent) => {
-    const st = threeStateRef.current;
-    st.cameraDistance = Math.max(3.5, Math.min(10.0, st.cameraDistance + e.deltaY * 0.005));
-    if (st.camera) {
-      st.camera.position.z = st.cameraDistance;
-    }
-  };
+  const getPingForGlobe = useCallback((p1: { id: string; lat: number; lng: number }, p2: { id: string; lat: number; lng: number }) => {
+    const fullP1 = players[p1.id];
+    const fullP2 = players[p2.id];
+    if (!fullP1 || !fullP2) return 50;
+    return calculateEstimatedPing(fullP1, fullP2).ping;
+  }, [players]);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none">
@@ -1220,7 +711,7 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-2">
-          {sessionId && (
+          {sessionId && !sessionNotFound && (
             <div className="flex items-center gap-2 bg-slate-800/80 border border-slate-700 rounded-lg px-3 py-1.5 text-xs">
               <span className="text-slate-400">Session:</span>
               <span className="font-mono text-cyan-300 font-semibold">{sessionId}</span>
@@ -1244,17 +735,39 @@ export default function App() {
         </div>
       </header>
 
-      {isSessionExpired && (
+      {authError && (
+        <div className="bg-rose-950/90 border-b border-rose-800 px-4 py-2.5 text-xs text-rose-200 flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+          <span>Firebase Connection Error: {authError}</span>
+        </div>
+      )}
+
+      {sessionExpired && (
         <div className="bg-amber-950/80 border-b border-amber-800 px-4 py-2.5 text-xs text-amber-200 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-400" />
-            <span>This session has expired (24h limit reached). Please create a fresh session for new games.</span>
+            <span>This session has reached its 24-hour expiration limit and is no longer active.</span>
           </div>
           <button
             onClick={createNewSession}
             className="px-3 py-1 rounded bg-amber-500 text-slate-950 font-semibold hover:bg-amber-400 text-xs"
           >
             New Session
+          </button>
+        </div>
+      )}
+
+      {sessionNotFound && (
+        <div className="bg-rose-950/80 border-b border-rose-800 px-4 py-3 text-xs text-rose-200 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-rose-400" />
+            <span>Session not found. The link may be invalid or expired.</span>
+          </div>
+          <button
+            onClick={createNewSession}
+            className="px-3 py-1 rounded bg-cyan-600 text-white font-semibold hover:bg-cyan-500 text-xs"
+          >
+            Create New Session
           </button>
         </div>
       )}
@@ -1307,54 +820,21 @@ export default function App() {
                 </div>
               </>
             )}
-            <span className="ml-3 text-slate-500 hidden sm:inline">• Geographic Earth map • Drag to rotate, scroll to zoom</span>
+            <span className="ml-3 text-slate-500 hidden sm:inline">• Earth Map • Drag to rotate, scroll to zoom</span>
           </div>
 
-          <canvas
-            ref={canvasRef}
-            onPointerDown={handlePointerDown}
-            onPointerMove={handlePointerMove}
-            onPointerUp={handlePointerUp}
-            onWheel={handleWheel}
-            className="w-full h-full cursor-grab active:cursor-grabbing block"
-          />
-
-          <div className="absolute inset-0 pointer-events-none overflow-hidden">
-            {screenNodes.map(node => {
-              if (!node.visible) return null;
-              return (
-                <div
-                  key={node.id}
-                  style={{
-                    transform: `translate(${node.x}px, ${node.y}px)`,
-                    left: 0,
-                    top: 0
-                  }}
-                  className="absolute pointer-events-none -translate-x-1/2 -translate-y-8 flex flex-col items-center transition-transform duration-75"
-                >
-                  <div
-                    className={`px-2 py-0.5 rounded text-[11px] font-semibold tracking-wide whitespace-nowrap shadow-lg flex items-center gap-1 border ${
-                      node.isHost
-                        ? 'bg-amber-500 text-slate-950 border-amber-300'
-                        : 'bg-slate-900/90 text-cyan-300 border-cyan-800/80 backdrop-blur-sm'
-                    }`}
-                  >
-                    {node.isHost && <Trophy className="w-3 h-3 text-slate-950 inline" />}
-                    <span>{node.name}</span>
-                  </div>
-                  <div
-                    className={`w-1.5 h-1.5 rotate-45 -mt-1 ${
-                      node.isHost ? 'bg-amber-400' : 'bg-slate-900 border-r border-b border-cyan-800'
-                    }`}
-                  ></div>
-                </div>
-              );
-            })}
-          </div>
+          <Suspense fallback={<div className="text-slate-500 text-xs">Loading 3D Globe...</div>}>
+            <GlobeView
+              playersList={playersList}
+              activeHost={activeHost}
+              hasAnalyzed={hasAnalyzed}
+              getPing={getPingForGlobe}
+            />
+          </Suspense>
         </div>
 
         <div className="lg:col-span-5 xl:col-span-4 flex flex-col bg-slate-900/40 divide-y divide-slate-800 overflow-y-auto max-h-screen">
-          {!sessionId ? (
+          {!sessionId || sessionNotFound ? (
             <div className="p-6 flex flex-col items-center text-center justify-center flex-1">
               <div className="w-16 h-16 rounded-2xl bg-cyan-950/70 border border-cyan-800 flex items-center justify-center mb-4 text-cyan-400 shadow-xl shadow-cyan-950/50">
                 <Globe2 className="w-8 h-8" />
@@ -1371,6 +851,8 @@ export default function App() {
                 <span>Create New Session</span>
               </button>
             </div>
+          ) : sessionLoading ? (
+            <div className="p-8 text-center text-slate-400 text-xs">Loading session data...</div>
           ) : (
             <>
               <div className="p-5 bg-slate-900/80">
@@ -1397,6 +879,7 @@ export default function App() {
                     <label className="block text-xs font-medium text-slate-300 mb-1">Display Name</label>
                     <input
                       type="text"
+                      maxLength={24}
                       value={name}
                       onChange={e => setName(e.target.value)}
                       placeholder="e.g. Alex"
@@ -1458,7 +941,7 @@ export default function App() {
 
                     <div className="mt-1 flex items-center gap-1 text-[11px] text-emerald-400/90">
                       <Lock className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
-                      <span>Zero-IP Protected: Exact coordinates are rounded to ~city level. IP is never collected.</span>
+                      <span>City-level rounding (~11 km). Exact coordinates are not stored.</span>
                     </div>
                   </div>
 
@@ -1475,13 +958,17 @@ export default function App() {
                         className="text-[11px] px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 transition flex items-center gap-1"
                       >
                         <RotateCw className={`w-3 h-3 ${isTestingNet ? 'animate-spin' : ''}`} />
-                        <span>{isTestingNet ? 'Testing...' : netTestDone ? 'Retest' : 'Auto-Test'}</span>
+                        <span>{isTestingNet ? 'Testing...' : latencyMs !== null ? 'Retest' : 'Auto-Test'}</span>
                       </button>
                     </div>
 
+                    {netTestError && (
+                      <p className="text-[11px] text-rose-400">{netTestError}</p>
+                    )}
+
                     <div className="grid grid-cols-2 gap-2 text-xs">
                       <div>
-                        <span className="text-slate-400 text-[11px]">Upload (Mbps)</span>
+                        <span className="text-slate-400 text-[11px]">Upload (Mbps, self-reported)</span>
                         <input
                           type="number"
                           min={1}
@@ -1492,58 +979,72 @@ export default function App() {
                         />
                       </div>
                       <div>
-                        <span className="text-slate-400 text-[11px]">Connection Type</span>
-                        <div className="grid grid-cols-2 gap-1 mt-0.5">
-                          <button
-                            type="button"
-                            onClick={() => setConnectionType('wired')}
-                            className={`py-1 rounded text-[11px] flex items-center justify-center gap-1 border ${
-                              connectionType === 'wired'
-                                ? 'bg-cyan-950 text-cyan-300 border-cyan-700'
-                                : 'bg-slate-900 text-slate-400 border-slate-800'
-                            }`}
-                          >
-                            <Cable className="w-3 h-3" />
-                            <span>Wired</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setConnectionType('wifi')}
-                            className={`py-1 rounded text-[11px] flex items-center justify-center gap-1 border ${
-                              connectionType === 'wifi'
-                                ? 'bg-cyan-950 text-cyan-300 border-cyan-700'
-                                : 'bg-slate-900 text-slate-400 border-slate-800'
-                            }`}
-                          >
-                            <Wifi className="w-3 h-3" />
-                            <span>Wi-Fi</span>
-                          </button>
-                        </div>
+                        <span className="text-slate-400 text-[11px]">Download (Mbps, self-reported)</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={2000}
+                          value={downloadMbps}
+                          onChange={e => setDownloadMbps(Number(e.target.value))}
+                          className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs mt-0.5"
+                        />
                       </div>
                     </div>
 
                     <div className="grid grid-cols-2 gap-2 text-xs">
                       <div>
-                        <span className="text-slate-400 text-[11px]">Ping to Internet</span>
+                        <span className="text-slate-400 text-[11px]">Ping to Internet (measured)</span>
                         <input
                           type="number"
-                          min={1}
-                          max={500}
-                          value={latencyMs}
-                          onChange={e => setLatencyMs(Number(e.target.value))}
+                          min={0}
+                          max={1000}
+                          value={latencyMs !== null ? latencyMs : ''}
+                          placeholder="Run Auto-Test"
+                          onChange={e => setLatencyMs(e.target.value ? Number(e.target.value) : null)}
                           className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs mt-0.5"
                         />
                       </div>
                       <div>
-                        <span className="text-slate-400 text-[11px]">Jitter (ms)</span>
+                        <span className="text-slate-400 text-[11px]">Jitter (ms, measured)</span>
                         <input
                           type="number"
                           min={0}
-                          max={100}
-                          value={jitterMs}
-                          onChange={e => setJitterMs(Number(e.target.value))}
+                          max={500}
+                          value={jitterMs !== null ? jitterMs : ''}
+                          placeholder="Run Auto-Test"
+                          onChange={e => setJitterMs(e.target.value ? Number(e.target.value) : null)}
                           className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs mt-0.5"
                         />
+                      </div>
+                    </div>
+
+                    <div>
+                      <span className="text-slate-400 text-[11px]">Connection Type</span>
+                      <div className="grid grid-cols-2 gap-1 mt-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setConnectionType('wired')}
+                          className={`py-1 rounded text-[11px] flex items-center justify-center gap-1 border ${
+                            connectionType === 'wired'
+                              ? 'bg-cyan-950 text-cyan-300 border-cyan-700'
+                              : 'bg-slate-900 text-slate-400 border-slate-800'
+                          }`}
+                        >
+                          <Cable className="w-3 h-3" />
+                          <span>Wired</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConnectionType('wifi')}
+                          className={`py-1 rounded text-[11px] flex items-center justify-center gap-1 border ${
+                            connectionType === 'wifi'
+                              ? 'bg-cyan-950 text-cyan-300 border-cyan-700'
+                              : 'bg-slate-900 text-slate-400 border-slate-800'
+                          }`}
+                        >
+                          <Wifi className="w-3 h-3" />
+                          <span>Wi-Fi</span>
+                        </button>
                       </div>
                     </div>
                   </div>
@@ -1576,7 +1077,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {playersList.filter(p => p.id !== currentUserId).length > 0 && (
+                  {currentUser && playersList.filter(p => p.id !== currentUser.uid).length > 0 && (
                     <div className="p-2.5 bg-slate-950/60 border border-slate-800 rounded-lg">
                       <div className="flex items-center justify-between mb-1">
                         <span className="text-[11px] font-medium text-slate-300">
@@ -1586,7 +1087,7 @@ export default function App() {
                       </div>
                       <div className="space-y-1.5 max-h-24 overflow-y-auto pr-1">
                         {playersList
-                          .filter(p => p.id !== currentUserId)
+                          .filter(p => p.id !== currentUser.uid)
                           .map(other => (
                             <div key={other.id} className="flex items-center justify-between text-xs">
                               <span className="text-slate-300 truncate max-w-[120px]">{other.name}</span>
@@ -1634,7 +1135,7 @@ export default function App() {
                     </div>
 
                     <span className="text-[11px] text-slate-400 font-mono">
-                      {playersList.length} Players ({playersList.length - 1} Peers)
+                      {playersList.length} Players ({Math.max(0, playersList.length - 1)} Peers)
                     </span>
                   </div>
 
@@ -1646,7 +1147,7 @@ export default function App() {
                           ? 'bg-amber-500 text-slate-950 font-bold'
                           : 'text-slate-400 hover:text-white'
                       }`}
-                      title="Best for large groups: picks candidate in the middle of all 19 peers"
+                      title="Best for large groups: picks candidate in the middle of all peers"
                     >
                       Middle of All Peers
                     </button>
@@ -1875,7 +1376,7 @@ export default function App() {
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2 text-emerald-400">
                 <ShieldCheck className="w-5 h-5" />
-                <h3 className="font-bold text-base text-white">Zero-IP Privacy & Security Shield</h3>
+                <h3 className="font-bold text-base text-white">Privacy & Security Information</h3>
               </div>
               <button
                 onClick={() => setShowSecurityModal(false)}
@@ -1889,27 +1390,30 @@ export default function App() {
               <div className="p-3 rounded-lg bg-emerald-950/40 border border-emerald-800/50 flex items-start gap-2.5">
                 <Lock className="w-4 h-4 text-emerald-400 flex-shrink-0 mt-0.5" />
                 <div>
-                  <h4 className="font-semibold text-emerald-300 mb-0.5">Your IP Address is Never Stored or Shared</h4>
+                  <h4 className="font-semibold text-emerald-300 mb-0.5">How Your Information is Handled</h4>
                   <p className="text-[11px] text-slate-300">
-                    Host Finder does not collect, record, log, or broadcast peer IP addresses. Your actual public IP remains completely invisible to other players in the session.
+                    Host Finder does not collect or store your IP address in Firestore. Only your chosen display name, self-reported connection details, and approximate coordinates are stored.
                   </p>
                 </div>
               </div>
 
               <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
-                <h4 className="font-semibold text-slate-200">How Your Data is Protected:</h4>
+                <h4 className="font-semibold text-slate-200">Security Architecture:</h4>
                 <ul className="list-disc list-inside space-y-1 text-slate-400 text-[11px]">
                   <li>
-                    <strong className="text-slate-300">City-Level Precision Only:</strong> Coordinates are rounded to ~1 decimal place (roughly an 11 km radius). Exact home addresses are impossible to determine.
+                    <strong className="text-slate-300">City-Level Location Obfuscation:</strong> Coordinates are rounded to ~1 decimal place (~11 km radius). Exact residential addresses are not accepted or stored.
                   </li>
                   <li>
-                    <strong className="text-slate-300">Anonymous Ownership:</strong> Entries are bound to an ephemeral anonymous UID. Only your browser can edit or delete your entry.
+                    <strong className="text-slate-300">Firebase Anonymous Authentication:</strong> Each player is assigned an anonymous UID. Firestore Security Rules enforce that you can only edit or delete your own player document.
                   </li>
                   <li>
-                    <strong className="text-slate-300">Automatic 24-Hour Expiration:</strong> All sessions and room records automatically expire and are purged after 24 hours.
+                    <strong className="text-slate-300">Automatic 24-Hour Expiration:</strong> Sessions are timestamped with a 24-hour expiration window.
                   </li>
                   <li>
-                    <strong className="text-slate-300">Instant Removal:</strong> You can click the &quot;Remove My Data&quot; button at any time to instantly wipe your entry from the database.
+                    <strong className="text-slate-300">Network Transparency:</strong> Standard web requests (fetching Firestore, Open-Meteo geocoding, Cloudflare latency probes) connect your browser directly to those service providers over TLS.
+                  </li>
+                  <li>
+                    <strong className="text-slate-300">Data Deletion:</strong> Clicking &quot;Remove My Data&quot; deletes your document from the session subcollection immediately.
                   </li>
                 </ul>
               </div>

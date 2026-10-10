@@ -1,0 +1,70 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidPlayer(data, uid) {
+      return data.userId == uid
+        && data.name is string
+        && data.name.size() > 0
+        && data.name.size() <= 24
+        && data.cityName is string
+        && data.cityName.size() <= 60
+        && data.lat is number
+        && data.lat >= -90
+        && data.lat <= 90
+        && data.lng is number
+        && data.lng >= -180
+        && data.lng <= 180
+        && data.connectionType in ['wired', 'wifi']
+        && data.uploadMbps is number
+        && data.uploadMbps >= 1
+        && data.uploadMbps <= 2000
+        && data.downloadMbps is number
+        && data.downloadMbps >= 1
+        && data.downloadMbps <= 2000
+        && data.latencyMs is number
+        && data.latencyMs >= 0
+        && data.latencyMs <= 1000
+        && data.jitterMs is number
+        && data.jitterMs >= 0
+        && data.jitterMs <= 500
+        && data.pcStrength in ['low', 'medium', 'high']
+        && data.canHost in ['yes', 'no', 'only_if_needed']
+        && (!('radminPings' in data) || (data.radminPings is map && data.radminPings.size() <= 64));
+    }
+
+    match /sessions/{sessionId} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn()
+        && sessionId.matches('^[a-zA-Z0-9_-]{16}$')
+        && request.resource.data.keys().hasAll(['createdAt', 'expiresAt', 'createdBy'])
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt <= request.time + duration.value(24, 'h')
+        && request.resource.data.createdBy == request.auth.uid;
+
+      allow update, delete: if false;
+
+      match /players/{uid} {
+        allow read: if isSignedIn();
+
+        allow create, update: if isSignedIn()
+          && request.auth.uid == uid
+          && isValidPlayer(request.resource.data, uid);
+
+        allow delete: if isSignedIn()
+          && request.auth.uid == uid;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
