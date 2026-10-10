@@ -557,7 +557,7 @@ export default function App() {
       const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
       await deleteDoc(doc(getFirestore(app), 'sessions', leavingSessionId, 'players', uid));
     } catch {
-      setAppError('You left the session, but your player entry could not be removed. It may stay visible to others in that session until it expires and is deleted automatically.');
+      setAppError('You left the session, but your player entry could not be removed. It stays visible to anyone with that session link until the site owner removes it manually.');
     }
   }, [sessionId, currentUser]);
 
@@ -661,7 +661,7 @@ export default function App() {
         describeFirestoreError(
           err,
           'removing your player entry',
-          'Likely causes: you are not signed in as the user who created this entry, or the Firestore security rules are not published. The entry will be deleted automatically after it expires.'
+          'Likely causes: you are not signed in as the user who created this entry, or the Firestore security rules are not published.'
         )
       );
     }
@@ -1613,13 +1613,13 @@ export default function App() {
                     <strong className="text-slate-300">Firebase Anonymous Authentication:</strong> Each browser is assigned an anonymous Firebase user ID. Firestore Security Rules only allow you to create, edit, or delete your own player entry.
                   </li>
                   <li>
-                    <strong className="text-slate-300">Expiry and Automatic Deletion:</strong> Sessions and player entries get an expiry time no more than 23 hours after they are created or last updated, and the security rules reject expiry times more than 24 hours ahead. Once a session expires, new player entries and updates are rejected. Expired sessions and player entries are deleted automatically after they expire; deletion is not immediate and may be delayed. Until then, entries remain readable to anyone with the session link.
+                    <strong className="text-slate-300">Session Expiry:</strong> A session is treated as expired about 23 hours after it is created and cannot be joined or updated after that. Expired sessions and player entries are not deleted automatically. They remain readable by anyone with the session link until the site owner removes them manually.
                   </li>
                   <li>
                     <strong className="text-slate-300">Network Transparency:</strong> Your browser connects directly over TLS to Netlify (this site), Google Firebase (sign-in and Firestore), Open-Meteo (city search), and Cloudflare and Google DNS (latency test). Like any web request, these providers receive your IP address.
                   </li>
                   <li>
-                    <strong className="text-slate-300">Data Deletion:</strong> &quot;Remove My Data&quot; and &quot;Exit&quot; delete your player entry from the session. If deletion fails, the entry remains until it expires and is deleted automatically. The session record itself (creation and expiry times and the creator&apos;s anonymous user ID) cannot be deleted by users and is removed only after it expires.
+                    <strong className="text-slate-300">Data Deletion:</strong> &quot;Remove My Data&quot; deletes your own player entry immediately. &quot;Exit&quot; also tries to delete it; if that fails, the entry remains until you remove it or the site owner removes it manually. The session record itself (creation and expiry times and the creator&apos;s anonymous user ID) cannot be deleted by users.
                   </li>
                 </ul>
               </div>
